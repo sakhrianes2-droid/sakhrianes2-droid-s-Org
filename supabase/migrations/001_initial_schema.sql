@@ -27,19 +27,19 @@ CREATE TABLE IF NOT EXISTS public.profiles (
 -- Enable Row Level Security
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 
--- Idempotent RLS Policies for public.profiles
+-- Idempotent High-Performance RLS Policies for public.profiles
 DROP POLICY IF EXISTS "Users can view own profile" ON public.profiles;
 CREATE POLICY "Users can view own profile"
     ON public.profiles
     FOR SELECT
-    USING (auth.uid() = id);
+    USING ((select auth.uid()) = id);
 
 DROP POLICY IF EXISTS "Users can update own profile" ON public.profiles;
 CREATE POLICY "Users can update own profile"
     ON public.profiles
     FOR UPDATE
-    USING (auth.uid() = id)
-    WITH CHECK (auth.uid() = id);
+    USING ((select auth.uid()) = id)
+    WITH CHECK ((select auth.uid()) = id);
 
 DROP POLICY IF EXISTS "Admins can view all profiles" ON public.profiles;
 CREATE POLICY "Admins can view all profiles"
@@ -48,7 +48,7 @@ CREATE POLICY "Admins can view all profiles"
     USING (
         EXISTS (
             SELECT 1 FROM public.profiles p
-            WHERE p.id = auth.uid() AND p.role = 'admin'
+            WHERE p.id = (select auth.uid()) AND p.role = 'admin'
         )
     );
 
@@ -59,6 +59,23 @@ CREATE POLICY "Service role full access on profiles"
     TO service_role
     USING (true)
     WITH CHECK (true);
+
+-- Progressive Email Existence Check RPC (Step 2 of Progressive Disclosure Flow)
+CREATE OR REPLACE FUNCTION public.check_email_exists(lookup_email TEXT)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1
+        FROM public.profiles
+        WHERE lower(email) = lower(trim(lookup_email))
+    );
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.check_email_exists(TEXT) TO anon, authenticated, service_role;
 
 -- Function to handle new user registration from auth.users
 CREATE OR REPLACE FUNCTION public.handle_new_user()
@@ -122,7 +139,7 @@ CREATE INDEX IF NOT EXISTS idx_profiles_role ON public.profiles (role);
 
 
 -- ==============================================================================
--- 2. AUTHENTICATION & ACCESS AUDIT LOGS (public.auth_activity_logs)
+-- 2. AUTHENTICATION & ACCESS AUDIT LOGS (public.auth_activity_logs & user_activity_logs)
 -- ==============================================================================
 CREATE TABLE IF NOT EXISTS public.auth_activity_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -138,19 +155,50 @@ CREATE TABLE IF NOT EXISTS public.auth_activity_logs (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS public.user_activity_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+    email TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'SUCCESS',
+    ip_address TEXT,
+    user_agent TEXT,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
 -- Enable Row Level Security
 ALTER TABLE public.auth_activity_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_activity_logs ENABLE ROW LEVEL SECURITY;
 
--- RLS: Authenticated users can read their own logs (by user_id or email claim)
+-- High-Performance RLS using scalar subqueries (select auth.uid())
 DROP POLICY IF EXISTS "Users can view own audit logs" ON public.auth_activity_logs;
 CREATE POLICY "Users can view own audit logs"
     ON public.auth_activity_logs
     FOR SELECT
     TO authenticated
     USING (
-        auth.uid() = user_id
+        (select auth.uid()) = user_id
         OR
-        email = auth.jwt()->>'email'
+        email = ((select auth.jwt())->>'email')
+    );
+
+DROP POLICY IF EXISTS "Users can view own user_activity_logs" ON public.user_activity_logs;
+CREATE POLICY "Users can view own user_activity_logs"
+    ON public.user_activity_logs
+    FOR SELECT
+    TO authenticated
+    USING ((select auth.uid()) = user_id);
+
+DROP POLICY IF EXISTS "Users can insert own user_activity_logs" ON public.user_activity_logs;
+CREATE POLICY "Users can insert own user_activity_logs"
+    ON public.user_activity_logs
+    FOR INSERT
+    TO anon, authenticated
+    WITH CHECK (
+        ((select auth.uid()) IS NOT NULL AND ((select auth.uid()) = user_id OR user_id IS NULL))
+        OR
+        (event_type IN ('ACCESS_REQUEST', 'ACCESS_DENIED', 'SIGN_UP'))
     );
 
 -- RLS: Allow authenticated users to INSERT their own logs,
@@ -161,7 +209,7 @@ CREATE POLICY "Allow user activity logging"
     FOR INSERT
     TO anon, authenticated
     WITH CHECK (
-        (auth.uid() IS NOT NULL AND (auth.uid() = user_id OR user_id IS NULL))
+        ((select auth.uid()) IS NOT NULL AND ((select auth.uid()) = user_id OR user_id IS NULL))
         OR
         (event_type IN ('ACCESS_REQUEST', 'ACCESS_DENIED', 'SIGN_UP'))
     );
@@ -175,7 +223,7 @@ CREATE POLICY "Admins can view all audit logs"
     USING (
         EXISTS (
             SELECT 1 FROM public.profiles p
-            WHERE p.id = auth.uid() AND p.role = 'admin'
+            WHERE p.id = (select auth.uid()) AND p.role = 'admin'
         )
     );
 
@@ -226,11 +274,11 @@ CREATE POLICY "Users can view own beta request or admins view all"
     FOR SELECT
     TO authenticated
     USING (
-        (auth.jwt()->>'email' = email)
+        (((select auth.jwt())->>'email') = email)
         OR
         EXISTS (
             SELECT 1 FROM public.profiles p
-            WHERE p.id = auth.uid() AND p.role = 'admin'
+            WHERE p.id = (select auth.uid()) AND p.role = 'admin'
         )
     );
 
@@ -263,14 +311,14 @@ CREATE TABLE IF NOT EXISTS public.alerts (
 -- Enable Row Level Security
 ALTER TABLE public.alerts ENABLE ROW LEVEL SECURITY;
 
--- Full CRUD restricted to auth.uid() = user_id
+-- Full CRUD restricted to (select auth.uid()) = user_id
 DROP POLICY IF EXISTS "Users have full CRUD on own alerts" ON public.alerts;
 CREATE POLICY "Users have full CRUD on own alerts"
     ON public.alerts
     FOR ALL
     TO authenticated
-    USING (auth.uid() = user_id)
-    WITH CHECK (auth.uid() = user_id);
+    USING ((select auth.uid()) = user_id)
+    WITH CHECK ((select auth.uid()) = user_id);
 
 -- Service role full access
 DROP POLICY IF EXISTS "Service role full access on alerts" ON public.alerts;
@@ -297,14 +345,14 @@ CREATE TABLE IF NOT EXISTS public.pipeline_configs (
 -- Enable Row Level Security
 ALTER TABLE public.pipeline_configs ENABLE ROW LEVEL SECURITY;
 
--- Full CRUD restricted to auth.uid() = user_id
+-- Full CRUD restricted to (select auth.uid()) = user_id
 DROP POLICY IF EXISTS "Users have full CRUD on own pipeline configs" ON public.pipeline_configs;
 CREATE POLICY "Users have full CRUD on own pipeline configs"
     ON public.pipeline_configs
     FOR ALL
     TO authenticated
-    USING (auth.uid() = user_id)
-    WITH CHECK (auth.uid() = user_id);
+    USING ((select auth.uid()) = user_id)
+    WITH CHECK ((select auth.uid()) = user_id);
 
 -- Service role full access
 DROP POLICY IF EXISTS "Service role full access on pipeline configs" ON public.pipeline_configs;

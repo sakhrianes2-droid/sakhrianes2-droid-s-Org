@@ -67,24 +67,10 @@ export interface GlobalMacroIndex {
 
 export const RSS_FEEDS = [
   {
-    id: 'forexlive',
-    name: 'ForexLive News',
-    url: 'https://www.forexlive.com/feed',
-    domain: 'forexlive.com',
-    category: 'Macro',
-  },
-  {
-    id: 'cnbc',
-    name: 'CNBC Global Markets',
-    url: 'https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664',
-    domain: 'cnbc.com',
-    category: 'General',
-  },
-  {
-    id: 'wsj',
-    name: 'Wall Street Journal Markets',
-    url: 'https://feeds.a.dj.com/rss/RSSMarketsMain.xml',
-    domain: 'wsj.com',
+    id: 'google-macro',
+    name: 'Google Financial Markets Wire',
+    url: 'https://news.google.com/rss/search?q=forex+economy+central+bank+when:1d&hl=en-US&gl=US&ceid=US:en',
+    domain: 'news.google.com',
     category: 'Macro',
   },
   {
@@ -95,13 +81,93 @@ export const RSS_FEEDS = [
     category: 'Macro',
   },
   {
-    id: 'investing',
-    name: 'Investing.com News',
-    url: 'https://www.investing.com/rss/news_25.rss',
-    domain: 'investing.com',
-    category: 'Research',
+    id: 'cnbc',
+    name: 'CNBC Global Markets',
+    url: 'https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664',
+    domain: 'cnbc.com',
+    category: 'General',
+  },
+  {
+    id: 'google-rates',
+    name: 'Global Rates & FX Wire',
+    url: 'https://news.google.com/rss/search?q=Federal+Reserve+OR+ECB+OR+Treasury+when:1d&hl=en-US&gl=US&ceid=US:en',
+    domain: 'news.google.com',
+    category: 'Rates',
+  },
+  {
+    id: 'google-crypto',
+    name: 'Digital Assets & Macro Liquidity',
+    url: 'https://news.google.com/rss/search?q=bitcoin+crypto+ETF+when:1d&hl=en-US&gl=US&ceid=US:en',
+    domain: 'news.google.com',
+    category: 'Crypto',
   },
 ];
+
+export function isWithinLast24Hours(dateString: string | null | undefined, referenceTimeMs = Date.now()): boolean {
+  if (!dateString) return false;
+  const d = new Date(dateString);
+  const time = d.getTime();
+  if (Number.isNaN(time)) return false;
+  const ageMs = referenceTimeMs - time;
+  // Item must have been published within 24 hours (86,400,000 ms) and not in the far future (> 5 min)
+  return ageMs >= -300_000 && ageMs <= 24 * 60 * 60 * 1000;
+}
+
+export function parseRssXml(xmlText: string, fallbackSource = 'news.google.com'): NewsItem[] {
+  const items: NewsItem[] = [];
+  const itemRegex = /<item>([\s\S]*?)<\/item>/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = itemRegex.exec(xmlText)) !== null) {
+    const block = match[1];
+    const titleMatch =
+      block.match(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>/i) ||
+      block.match(/<title>([\s\S]*?)<\/title>/i);
+    const linkMatch =
+      block.match(/<link><!\[CDATA\[([\s\S]*?)\]\]><\/link>/i) ||
+      block.match(/<link>([\s\S]*?)<\/link>/i);
+    const pubDateMatch =
+      block.match(/<pubDate><!\[CDATA\[([\s\S]*?)\]\]><\/pubDate>/i) ||
+      block.match(/<pubDate>([\s\S]*?)<\/pubDate>/i);
+    const sourceMatch =
+      block.match(/<source[^>]*>([\s\S]*?)<\/source>/i);
+
+    let title = titleMatch ? titleMatch[1].trim() : '';
+    title = title
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#x27;/g, "'")
+      .replace(/&#39;/g, "'");
+
+    const link = linkMatch ? linkMatch[1].trim() : '#';
+    const published_at = pubDateMatch ? pubDateMatch[1].trim() : '';
+    const sourceName = sourceMatch ? sourceMatch[1].trim() : fallbackSource;
+
+    if (title) {
+      items.push({
+        source: sourceName,
+        title,
+        link,
+        published_at,
+      });
+    }
+  }
+
+  return items;
+}
+
+export function filterRecentNews(items: NewsItem[], referenceTimeMs = Date.now(), maxAgeHours = 24): NewsItem[] {
+  const maxAgeMs = maxAgeHours * 60 * 60 * 1000;
+  return items.filter((item) => {
+    if (!item.published_at) return false;
+    const itemTime = new Date(item.published_at).getTime();
+    if (Number.isNaN(itemTime)) return false;
+    const diff = referenceTimeMs - itemTime;
+    return diff >= -300_000 && diff <= maxAgeMs;
+  });
+}
 
 export const FALLBACK_BIASES: Record<string, Omit<DailyMarketBias, 'date' | 'asset_class'>> = {
   USD: {
@@ -112,14 +178,16 @@ export const FALLBACK_BIASES: Record<string, Omit<DailyMarketBias, 'date' | 'ass
       "The Federal Reserve's restrictive policy stance alongside resilient US economic prints continues to drive sustained institutional demand for the US Dollar.",
     latest_news: [
       {
-        source: 'bloomberg.com',
+        source: 'Bloomberg Markets',
         title: 'Dollar index maintains multi-month highs on persistent yield premium',
         link: 'https://bloomberg.com',
+        published_at: new Date(Date.now() - 1000 * 60 * 45).toISOString(),
       },
       {
-        source: 'forexlive.com',
+        source: 'ForexLive Wire',
         title: 'Fed speakers reiterate commitment to quantitative tightening targets',
         link: 'https://forexlive.com',
+        published_at: new Date(Date.now() - 1000 * 60 * 135).toISOString(),
       },
     ],
   },
@@ -131,14 +199,16 @@ export const FALLBACK_BIASES: Record<string, Omit<DailyMarketBias, 'date' | 'ass
       'Monetary policy divergence between the Federal Reserve and the European Central Bank exerts sustained downward pressure on the Euro.',
     latest_news: [
       {
-        source: 'wsj.com',
+        source: 'Wall Street Journal',
         title: 'ECB officials signal measured easing pace amidst weak industrial output',
         link: 'https://wsj.com',
+        published_at: new Date(Date.now() - 1000 * 60 * 60).toISOString(),
       },
       {
-        source: 'reuters.com',
+        source: 'Reuters Macro',
         title: 'Eurozone private sector activity registers modest contraction',
         link: 'https://reuters.com',
+        published_at: new Date(Date.now() - 1000 * 60 * 180).toISOString(),
       },
     ],
   },
@@ -150,14 +220,16 @@ export const FALLBACK_BIASES: Record<string, Omit<DailyMarketBias, 'date' | 'ass
       'Persistent geopolitical frictions and sovereign central bank bullion diversification provide a firm floor under precious metals.',
     latest_news: [
       {
-        source: 'cnbc.com',
+        source: 'CNBC Global',
         title: 'Gold extends structural consolidation near historic highs on reserve demand',
         link: 'https://cnbc.com',
+        published_at: new Date(Date.now() - 1000 * 60 * 90).toISOString(),
       },
       {
-        source: 'marketwatch.com',
+        source: 'MarketWatch',
         title: 'Central bank bullion reserves continue steady quarterly expansion',
         link: 'https://marketwatch.com',
+        published_at: new Date(Date.now() - 1000 * 60 * 210).toISOString(),
       },
     ],
   },
@@ -169,14 +241,16 @@ export const FALLBACK_BIASES: Record<string, Omit<DailyMarketBias, 'date' | 'ass
       'Long-term risk-free bond yields are compressing equity valuation multiples across technology and growth market leaders.',
     latest_news: [
       {
-        source: 'cnbc.com',
+        source: 'CNBC Markets',
         title: '10-Year Treasury yield volatility dampens broad equity risk appetite',
         link: 'https://cnbc.com',
+        published_at: new Date(Date.now() - 1000 * 60 * 50).toISOString(),
       },
       {
-        source: 'wsj.com',
+        source: 'Wall Street Journal',
         title: 'Fund managers rotate into defensive value and cash equivalents',
         link: 'https://wsj.com',
+        published_at: new Date(Date.now() - 1000 * 60 * 160).toISOString(),
       },
     ],
   },
@@ -188,14 +262,16 @@ export const FALLBACK_BIASES: Record<string, Omit<DailyMarketBias, 'date' | 'ass
       'Strict supply curtailments by producer nations balance out macroeconomic demand concerns, keeping energy prices rangebound.',
     latest_news: [
       {
-        source: 'reuters.com',
+        source: 'Reuters Energy',
         title: 'OPEC+ signals continuity in voluntary production restraint',
         link: 'https://reuters.com',
+        published_at: new Date(Date.now() - 1000 * 60 * 120).toISOString(),
       },
       {
-        source: 'bloomberg.com',
+        source: 'Bloomberg Energy',
         title: 'Commercial crude inventories oscillate within five-year averages',
         link: 'https://bloomberg.com',
+        published_at: new Date(Date.now() - 1000 * 60 * 300).toISOString(),
       },
     ],
   },
@@ -207,14 +283,16 @@ export const FALLBACK_BIASES: Record<string, Omit<DailyMarketBias, 'date' | 'ass
       'Steady institutional spot allocations alongside structural post-halving liquid supply restrictions support sustained directional upside.',
     latest_news: [
       {
-        source: 'coindesk.com',
+        source: 'CoinDesk Core',
         title: 'Spot digital asset products log consecutive positive weekly flows',
         link: 'https://coindesk.com',
+        published_at: new Date(Date.now() - 1000 * 60 * 40).toISOString(),
       },
       {
-        source: 'cnbc.com',
+        source: 'CNBC Crypto',
         title: 'Exchange reserve liquidity drops as long-term holdings accumulate',
         link: 'https://cnbc.com',
+        published_at: new Date(Date.now() - 1000 * 60 * 110).toISOString(),
       },
     ],
   },

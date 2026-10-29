@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
-import { User, Session, supabase, isSupabaseConfigured } from '../lib/supabase';
+import { User, Session, supabase, isSupabaseConfigured, createEnclaveJwt } from '../lib/supabase';
 
 export interface AuthActivityLog {
   id: string;
@@ -27,6 +27,12 @@ export interface SignUpResult {
   user?: User | null;
   session?: Session | null;
   needsEmailConfirmation?: boolean;
+  confirmationCode?: string;
+}
+
+export interface EmailExistenceResult {
+  exists: boolean;
+  source: 'supabase' | 'enclave';
 }
 
 interface AuthContextType {
@@ -35,8 +41,26 @@ interface AuthContextType {
   loading: boolean;
   isConfigured: boolean;
   activityLogs: AuthActivityLog[];
+  checkEmailExists: (email: string) => Promise<EmailExistenceResult>;
   signIn: (email: string, pass: string) => Promise<{ error: Error | null }>;
   signUp: (email: string, pass: string, metadata?: Record<string, any>) => Promise<SignUpResult>;
+  verifyEmailConfirmation: (
+    email: string,
+    code: string,
+    metadata?: Record<string, any>
+  ) => Promise<{ error: Error | null }>;
+  resendEmailConfirmation: (
+    email: string,
+    fullName?: string
+  ) => Promise<{ error: Error | null; confirmationCode?: string }>;
+  signInWithGoogle: (
+    gmailAddress?: string
+  ) => Promise<{
+    error: Error | null;
+    needsConfirmation?: boolean;
+    email?: string;
+    confirmationCode?: string;
+  }>;
   signOut: () => Promise<void>;
   requestBetaAccess: (request: BetaAccessRequest) => Promise<{ ticketNumber: string; error?: Error | null }>;
   logAuthEvent: (
@@ -49,6 +73,49 @@ interface AuthContextType {
 
 const LOCAL_STORAGE_SESSION_KEY = 'supernova_auth_session_v1';
 const LOCAL_STORAGE_LOGS_KEY = 'supernova_auth_activity_logs_v1';
+const LOCAL_STORAGE_EMAILS_KEY = 'supernova_registered_emails_v1';
+
+const DEFAULT_REGISTERED_EMAILS = [
+  'chief.quant@supernova.ai',
+  'alpha.trader@citadel-macro.com',
+  'quant.research@bridgewater.internal',
+  'macro.desk@millennium.com',
+];
+
+function getLocalRegisteredEmails(): Set<string> {
+  const set = new Set<string>(DEFAULT_REGISTERED_EMAILS);
+  try {
+    const raw = localStorage.getItem(LOCAL_STORAGE_EMAILS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (typeof item === 'string') set.add(item.trim().toLowerCase());
+        }
+      }
+    }
+  } catch {
+    // Ignore storage read errors
+  }
+  return set;
+}
+
+function addLocalRegisteredEmail(email: string): void {
+  const clean = email.trim().toLowerCase();
+  if (!clean || !clean.includes('@')) return;
+  const set = getLocalRegisteredEmails();
+  set.add(clean);
+  try {
+    localStorage.setItem(LOCAL_STORAGE_EMAILS_KEY, JSON.stringify(Array.from(set)));
+  } catch {
+    // Ignore storage write errors
+  }
+  fetch('/api/auth/register-email', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: clean }),
+  }).catch(() => {});
+}
 
 // Seed initial institutional audit telemetry for rich showcase
 const INITIAL_DEMO_LOGS: AuthActivityLog[] = [
@@ -61,7 +128,7 @@ const INITIAL_DEMO_LOGS: AuthActivityLog[] = [
     user_agent: 'Supernova Terminal / macOS x86_64',
     created_at: new Date(Date.now() - 1000 * 60 * 42).toISOString(),
     status: 'SUCCESS',
-    metadata: { role: 'Lead Quant Portfolio Manager', auth_method: 'Hardware Enclave / TLS' }
+    metadata: { role: 'Lead Quant Portfolio Manager', auth_method: 'Hardware Enclave / PKCE' },
   },
   {
     id: 'log-seed-2',
@@ -72,7 +139,7 @@ const INITIAL_DEMO_LOGS: AuthActivityLog[] = [
     user_agent: 'Supernova Terminal / macOS x86_64',
     created_at: new Date(Date.now() - 1000 * 60 * 18).toISOString(),
     status: 'SUCCESS',
-    metadata: { expiry_extended: '+24h', cipher: 'Ed25519' }
+    metadata: { expiry_extended: '+24h', cipher: 'ES256' },
   },
   {
     id: 'log-seed-3',
@@ -82,8 +149,8 @@ const INITIAL_DEMO_LOGS: AuthActivityLog[] = [
     user_agent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
     created_at: new Date(Date.now() - 1000 * 60 * 105).toISOString(),
     status: 'PENDING',
-    metadata: { ticket: 'SNV-BETA-9142', strategy: 'Global Macro Rates Arbitrage' }
-  }
+    metadata: { ticket: 'SNV-BETA-9142', strategy: 'Global Macro Rates Arbitrage' },
+  },
 ];
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -102,8 +169,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return INITIAL_DEMO_LOGS;
   });
 
-  // Track the last user ID that explicitly logged in to prevent duplicate SIGN_IN logs from onAuthStateChange
+  // Track last logged-in user ID and last event timestamp to filter duplicate onAuthStateChange logs on page reload / tab focus
   const lastLoggedInUserIdRef = useRef<string | null>(null);
+  const lastAuthEventTimeRef = useRef<Record<string, number>>({});
   const userRef = useRef<User | null>(null);
   userRef.current = user;
 
@@ -116,51 +184,122 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   }, [activityLogs]);
 
-  // Record an audit log entry
-  const logAuthEvent = useCallback(async (
-    eventType: AuthActivityLog['event_type'],
-    details?: Record<string, any>,
-    status: AuthActivityLog['status'] = 'SUCCESS'
-  ) => {
-    const currentUser = userRef.current;
-    const activeEmail = details?.email || currentUser?.email || 'unauthenticated@guest.io';
-    const activeUserId = details?.user_id !== undefined ? details.user_id : (currentUser?.id || null);
+  // Record an audit log entry in both user_activity_logs and auth_activity_logs
+  const logAuthEvent = useCallback(
+    async (
+      eventType: AuthActivityLog['event_type'],
+      details?: Record<string, any>,
+      status: AuthActivityLog['status'] = 'SUCCESS'
+    ) => {
+      const currentUser = userRef.current;
+      const activeEmail = details?.email || currentUser?.email || 'unauthenticated@guest.io';
+      const activeUserId = details?.user_id !== undefined ? details.user_id : currentUser?.id || null;
 
-    const newLog: AuthActivityLog = {
-      id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      user_id: activeUserId || undefined,
-      email: activeEmail,
-      event_type: eventType,
-      ip_address: details?.ip || '127.0.0.1 (Local Enclave Loopback)',
-      user_agent: navigator.userAgent || 'Supernova-Frontend-Client',
-      metadata: details || {},
-      created_at: new Date().toISOString(),
-      status
-    };
+      // Deduplicate rapid identical events (e.g. tab focus / reload firing onAuthStateChange)
+      const dedupeKey = `${eventType}:${activeUserId || activeEmail}`;
+      const nowMs = Date.now();
+      const prevMs = lastAuthEventTimeRef.current[dedupeKey] || 0;
+      if (nowMs - prevMs < 2500 && !details?.forceLog) {
+        return;
+      }
+      lastAuthEventTimeRef.current[dedupeKey] = nowMs;
 
-    setActivityLogs((prev) => [newLog, ...prev.filter(l => l.id !== newLog.id)].slice(0, 50));
+      const newLog: AuthActivityLog = {
+        id: `log-${nowMs}-${Math.random().toString(36).slice(2, 7)}`,
+        user_id: activeUserId || undefined,
+        email: activeEmail,
+        event_type: eventType,
+        ip_address: details?.ip || '127.0.0.1 (Local Enclave Loopback)',
+        user_agent: navigator.userAgent || 'Supernova-Frontend-Client',
+        metadata: details || {},
+        created_at: new Date().toISOString(),
+        status,
+      };
 
-    // If Supabase is configured and reachable, attempt persisting to Postgres table
+      setActivityLogs((prev) => [newLog, ...prev.filter((l) => l.id !== newLog.id)].slice(0, 50));
+
+      // If Supabase is configured and reachable, persist to both user_activity_logs and auth_activity_logs
+      if (isSupabaseConfigured) {
+        const logPayload = {
+          user_id: activeUserId,
+          email: activeEmail,
+          event_type: eventType,
+          status,
+          user_agent: navigator.userAgent || 'Supernova-Frontend-Client',
+          metadata: details || {},
+          ip_address: details?.ip || null,
+        };
+        try {
+          await Promise.allSettled([
+            supabase.from('user_activity_logs').insert([logPayload]),
+            supabase.from('auth_activity_logs').insert([logPayload]),
+          ]);
+        } catch (err) {
+          console.warn('[Telemetry] Supabase activity logging warning:', err);
+        }
+      }
+    },
+    []
+  );
+
+  // Check if an email address is already registered (Step 2 of Progressive Disclosure Flow)
+  const checkEmailExists = useCallback(async (email: string): Promise<EmailExistenceResult> => {
+    const cleanEmail = email.trim().toLowerCase();
+    if (!cleanEmail || !cleanEmail.includes('@')) {
+      return { exists: false, source: 'enclave' };
+    }
+
+    // 1. Query Supabase if configured
     if (isSupabaseConfigured) {
       try {
-        const { error } = await supabase.from('auth_activity_logs').insert([
-          {
-            user_id: activeUserId,
-            email: activeEmail,
-            event_type: eventType,
-            status,
-            user_agent: navigator.userAgent || 'Supernova-Frontend-Client',
-            metadata: details || {},
-            ip_address: details?.ip || null,
-          }
-        ]);
-        if (error) {
-          console.warn('[Telemetry] Supabase activity log insert error:', error.message, error);
+        const { data: rpcExists, error: rpcError } = await supabase.rpc('check_email_exists', {
+          lookup_email: cleanEmail,
+        });
+        if (!rpcError && typeof rpcExists === 'boolean') {
+          if (rpcExists) addLocalRegisteredEmail(cleanEmail);
+          return { exists: rpcExists, source: 'supabase' };
         }
-      } catch (err) {
-        console.warn('[Telemetry] Supabase activity logging warning:', err);
+
+        const { data: profileData, error: profileError } = await supabase
+          .from('profiles')
+          .select('id')
+          .ilike('email', cleanEmail)
+          .maybeSingle();
+
+        if (!profileError && profileData?.id) {
+          addLocalRegisteredEmail(cleanEmail);
+          return { exists: true, source: 'supabase' };
+        }
+      } catch {
+        // Fallback to backend / local enclave check
       }
     }
+
+    // 2. Check local registered emails set
+    const localSet = getLocalRegisteredEmails();
+    if (localSet.has(cleanEmail)) {
+      return { exists: true, source: 'enclave' };
+    }
+
+    // 3. Query backend /api/auth/check-email
+    try {
+      const res = await fetch('/api/auth/check-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: cleanEmail }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.exists) {
+          addLocalRegisteredEmail(cleanEmail);
+          return { exists: true, source: 'enclave' };
+        }
+      }
+    } catch {
+      // Ignore network error
+    }
+
+    return { exists: false, source: isSupabaseConfigured ? 'supabase' : 'enclave' };
   }, []);
 
   // Hydrate activityLogs from Supabase Postgres when authenticated & configured
@@ -172,15 +311,24 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const fetchLogs = async () => {
       try {
         const { data, error } = await supabase
+          .from('user_activity_logs')
+          .select('*')
+          .order('created_at', { ascending: false })
+          .limit(50);
+
+        if (!error && data && isSubscribed && data.length > 0) {
+          setActivityLogs(data as AuthActivityLog[]);
+          return;
+        }
+
+        const { data: fallbackData, error: fallbackErr } = await supabase
           .from('auth_activity_logs')
           .select('*')
           .order('created_at', { ascending: false })
           .limit(50);
 
-        if (!error && data && isSubscribed) {
-          if (data.length > 0) {
-            setActivityLogs(data as AuthActivityLog[]);
-          }
+        if (!fallbackErr && fallbackData && isSubscribed && fallbackData.length > 0) {
+          setActivityLogs(fallbackData as AuthActivityLog[]);
         }
       } catch (err) {
         console.warn('[Telemetry] Error fetching audit logs from Supabase:', err);
@@ -189,12 +337,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     fetchLogs();
 
-    // Subscribe to realtime inserts on auth_activity_logs table
     const channel = supabase
-      .channel('public:auth_activity_logs')
+      .channel('public:user_activity_logs')
       .on(
         'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'auth_activity_logs' },
+        { event: 'INSERT', schema: 'public', table: 'user_activity_logs' },
         (payload) => {
           if (isSubscribed && payload.new) {
             const newLog = payload.new as AuthActivityLog;
@@ -217,14 +364,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const initAuth = async () => {
       if (isSupabaseConfigured) {
         try {
-          const { data: { session: currentSession } } = await supabase.auth.getSession();
+          const {
+            data: { session: currentSession },
+          } = await supabase.auth.getSession();
           if (mounted) {
             if (currentSession?.user) {
               setSession(currentSession);
               setUser(currentSession.user);
               lastLoggedInUserIdRef.current = currentSession.user.id;
             } else {
-              // Check if we have an active registered session in localStorage
               const saved = localStorage.getItem(LOCAL_STORAGE_SESSION_KEY);
               if (saved) {
                 try {
@@ -246,11 +394,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           if (mounted) setLoading(false);
         }
 
-        // Subscribe to real-time auth changes from Supabase
-        const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, newSession) => {
+        // Subscribe to real-time auth changes from Supabase, filtering duplicate reload/focus events
+        const {
+          data: { subscription },
+        } = supabase.auth.onAuthStateChange(async (event, newSession) => {
           if (!mounted) return;
 
-          // Initial session load event from Supabase client v2 - never duplicate log
+          // Ignore INITIAL_SESSION or tab-focus duplicate SIGNED_IN for an already-tracked user
           if (event === 'INITIAL_SESSION') {
             if (newSession?.user) {
               setSession(newSession);
@@ -265,7 +415,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             return;
           }
 
-          // User sign out: handled deterministically by signOut()
           if (event === 'SIGNED_OUT') {
             setSession(null);
             setUser(null);
@@ -275,7 +424,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             return;
           }
 
-          // Active session received (e.g. OAuth redirect, TOKEN_REFRESHED)
           if (newSession?.user) {
             setSession(newSession);
             setUser(newSession.user);
@@ -286,14 +434,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             setLoading(false);
 
             if (event === 'TOKEN_REFRESHED') {
-              await logAuthEvent('TOKEN_REFRESH', { email: newSession.user.email, user_id: newSession.user.id });
+              await logAuthEvent('TOKEN_REFRESH', {
+                email: newSession.user.email,
+                user_id: newSession.user.id,
+              });
             } else if (event === 'SIGNED_IN') {
-              // Only log if this was an external OAuth redirect (not already logged by signIn or signUp)
               if (lastLoggedInUserIdRef.current !== newSession.user.id) {
                 lastLoggedInUserIdRef.current = newSession.user.id;
                 await logAuthEvent('SIGN_IN', {
                   email: newSession.user.email,
-                  provider: newSession.user.app_metadata?.provider || 'oauth',
+                  provider: newSession.user.app_metadata?.provider || 'pkce_oauth',
                   user_id: newSession.user.id,
                 });
               }
@@ -301,7 +451,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             return;
           }
 
-          // Truly unauthenticated state
           setSession(null);
           setUser(null);
           lastLoggedInUserIdRef.current = null;
@@ -312,15 +461,23 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           subscription.unsubscribe();
         };
       } else {
-        // Fallback demo/offline authentication state from localStorage
         try {
           const savedSession = localStorage.getItem(LOCAL_STORAGE_SESSION_KEY);
           if (savedSession) {
             const parsed = JSON.parse(savedSession);
-            if (mounted) {
-              setSession(parsed.session);
+            if (mounted && parsed?.user) {
+              // Ensure session access_token is a valid 3-part JWT
+              const validJwt =
+                parsed.session?.access_token?.split('.').length === 3
+                  ? parsed.session.access_token
+                  : createEnclaveJwt(parsed.user.id, parsed.user.email || 'quant@supernova.ai');
+              const hydratedSession = {
+                ...parsed.session,
+                access_token: validJwt,
+              };
+              setSession(hydratedSession);
               setUser(parsed.user);
-              lastLoggedInUserIdRef.current = parsed.user?.id || null;
+              lastLoggedInUserIdRef.current = parsed.user.id || null;
             }
           }
         } catch (e) {
@@ -355,6 +512,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
         if (!error && data.session && data.user) {
           lastLoggedInUserIdRef.current = data.user.id;
+          addLocalRegisteredEmail(cleanEmail);
           setSession(data.session);
           setUser(data.user);
           localStorage.setItem(
@@ -374,11 +532,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     }
 
-    // Local Enclave development / fallback mode: establish verified quant session
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise((r) => setTimeout(r, 250));
 
+    const userId = `usr-demo-${Math.random().toString(36).slice(2, 9)}`;
     const simulatedUser: User = {
-      id: `usr-demo-${Math.random().toString(36).slice(2, 9)}`,
+      id: userId,
       app_metadata: { provider: 'demo_quant_enclave' },
       user_metadata: {
         full_name: cleanEmail.split('@')[0].replace('.', ' ').toUpperCase(),
@@ -404,8 +562,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       updated_at: new Date().toISOString(),
     };
 
+    const jwtToken = createEnclaveJwt(userId, cleanEmail, 86400);
     const simulatedSession: Session = {
-      access_token: `snv_jwt_demo_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+      access_token: jwtToken,
       token_type: 'bearer',
       expires_in: 86400,
       expires_at: Math.floor(Date.now() / 1000) + 86400,
@@ -414,6 +573,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
 
     lastLoggedInUserIdRef.current = simulatedUser.id;
+    addLocalRegisteredEmail(cleanEmail);
     setUser(simulatedUser);
     setSession(simulatedSession);
     localStorage.setItem(
@@ -465,7 +625,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           return { error };
         }
 
-        // Handle auto-confirmed sessions (email confirmation turned off in Supabase)
+        addLocalRegisteredEmail(cleanEmail);
+
         if (data.session && data.user) {
           lastLoggedInUserIdRef.current = data.user.id;
           setSession(data.session);
@@ -475,13 +636,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             JSON.stringify({ session: data.session, user: data.user })
           );
 
-          await logAuthEvent('SIGN_UP', {
-            email: cleanEmail,
-            user_id: data.user.id,
-            auto_confirmed: true,
-            provider: 'supabase_email',
-            ...metadata,
-          }, 'SUCCESS');
+          await logAuthEvent(
+            'SIGN_UP',
+            {
+              email: cleanEmail,
+              user_id: data.user.id,
+              auto_confirmed: true,
+              provider: 'supabase_email',
+              ...metadata,
+            },
+            'SUCCESS'
+          );
 
           setLoading(false);
           return {
@@ -492,17 +657,35 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           };
         }
 
-        // Handle email-confirmation-required states
         if (data.user && !data.session) {
-          await logAuthEvent('SIGN_UP', {
-            email: cleanEmail,
-            user_id: null,
-            unconfirmed_id: data.user.id,
-            auto_confirmed: false,
-            status: 'PENDING_CONFIRMATION',
-            provider: 'supabase_email',
-            ...metadata,
-          }, 'PENDING');
+          let generatedCode: string | undefined;
+          try {
+            const resp = await fetch('/api/auth/send-confirmation', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ email: cleanEmail, fullName: metadata?.full_name }),
+            });
+            if (resp.ok) {
+              const payload = await resp.json();
+              generatedCode = payload.confirmation_code;
+            }
+          } catch {
+            // Ignore fallback error
+          }
+
+          await logAuthEvent(
+            'SIGN_UP',
+            {
+              email: cleanEmail,
+              user_id: null,
+              unconfirmed_id: data.user.id,
+              auto_confirmed: false,
+              status: 'PENDING_CONFIRMATION',
+              provider: 'supabase_email',
+              ...metadata,
+            },
+            'PENDING'
+          );
 
           setLoading(false);
           return {
@@ -510,6 +693,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             user: data.user,
             session: null,
             needsEmailConfirmation: true,
+            confirmationCode: generatedCode,
           };
         }
 
@@ -525,78 +709,265 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         return { error: err };
       }
     } else {
-      // Offline local enclave demo mode
-      await new Promise((r) => setTimeout(r, 600));
+      let generatedCode = String(Math.floor(100000 + Math.random() * 900000));
+      try {
+        const resp = await fetch('/api/auth/send-confirmation', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: cleanEmail, fullName: metadata?.full_name }),
+        });
+        if (resp.ok) {
+          const payload = await resp.json();
+          if (payload.confirmation_code) {
+            generatedCode = payload.confirmation_code;
+          }
+        }
+      } catch {
+        // Fallback to generated code
+      }
 
-      const simulatedUser: User = {
-        id: `usr-demo-${Math.random().toString(36).slice(2, 9)}`,
-        app_metadata: { provider: 'demo_quant_enclave' },
-        user_metadata: {
-          full_name: metadata?.full_name || cleanEmail.split('@')[0].toUpperCase(),
-          tier: 'QUANT_PRO',
-          firm: metadata?.firm || 'Supernova Trading Enclave',
-          role: metadata?.role || 'trader',
+      await logAuthEvent(
+        'SIGN_UP',
+        {
+          email: cleanEmail,
+          user_id: null,
+          status: 'PENDING_GMAIL_CONFIRMATION',
+          mode: 'local_enclave_simulation',
+          ...metadata,
         },
-        aud: 'authenticated',
-        confirmation_sent_at: '',
-        recovery_sent_at: '',
-        email_change_sent_at: '',
-        new_email: '',
-        new_phone: '',
-        invited_at: '',
-        action_link: '',
-        email: cleanEmail,
-        phone: '',
-        created_at: new Date().toISOString(),
-        confirmed_at: new Date().toISOString(),
-        email_confirmed_at: new Date().toISOString(),
-        phone_confirmed_at: '',
-        last_sign_in_at: new Date().toISOString(),
-        role: 'authenticated',
-        updated_at: new Date().toISOString(),
-      };
-
-      const simulatedSession: Session = {
-        access_token: `snv_jwt_demo_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
-        token_type: 'bearer',
-        expires_in: 86400,
-        expires_at: Math.floor(Date.now() / 1000) + 86400,
-        refresh_token: `snv_refresh_${Date.now()}`,
-        user: simulatedUser,
-      };
-
-      lastLoggedInUserIdRef.current = simulatedUser.id;
-      setUser(simulatedUser);
-      setSession(simulatedSession);
-      localStorage.setItem(
-        LOCAL_STORAGE_SESSION_KEY,
-        JSON.stringify({ session: simulatedSession, user: simulatedUser })
+        'PENDING'
       );
-
-      await logAuthEvent('SIGN_UP', {
-        email: cleanEmail,
-        user_id: simulatedUser.id,
-        mode: 'local_enclave_simulation',
-        ...metadata,
-      }, 'SUCCESS');
 
       setLoading(false);
       return {
         error: null,
-        user: simulatedUser,
-        session: simulatedSession,
-        needsEmailConfirmation: false,
+        user: null,
+        session: null,
+        needsEmailConfirmation: true,
+        confirmationCode: generatedCode,
       };
     }
   };
 
-  // Sign Out handler - strictly log before calling supabase.auth.signOut to preserve JWT authentication
+  // Verify 6-digit Gmail / Email Confirmation Code
+  const verifyEmailConfirmation = async (
+    email: string,
+    code: string,
+    metadata?: Record<string, any>
+  ): Promise<{ error: Error | null }> => {
+    setLoading(true);
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanCode = code.trim();
+
+    if (!cleanEmail || cleanCode.length < 6) {
+      setLoading(false);
+      return { error: new Error('Please enter the 6-digit confirmation code.') };
+    }
+
+    if (isSupabaseConfigured) {
+      try {
+        const { data, error } = await supabase.auth.verifyOtp({
+          email: cleanEmail,
+          token: cleanCode,
+          type: 'signup',
+        });
+
+        if (!error && data.session && data.user) {
+          lastLoggedInUserIdRef.current = data.user.id;
+          addLocalRegisteredEmail(cleanEmail);
+          setSession(data.session);
+          setUser(data.user);
+          localStorage.setItem(
+            LOCAL_STORAGE_SESSION_KEY,
+            JSON.stringify({ session: data.session, user: data.user })
+          );
+          await logAuthEvent('SIGN_IN', {
+            email: cleanEmail,
+            user_id: data.user.id,
+            provider: 'gmail_otp_verified',
+          });
+          setLoading(false);
+          return { error: null };
+        }
+      } catch {
+        // Fallback to backend confirmation verification
+      }
+    }
+
+    try {
+      const res = await fetch('/api/auth/verify-confirmation', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: cleanEmail, code: cleanCode }),
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        setLoading(false);
+        return {
+          error: new Error(errData.detail || 'Invalid or expired confirmation code.'),
+        };
+      }
+    } catch {
+      setLoading(false);
+      return { error: new Error('Could not verify confirmation code. Please try again.') };
+    }
+
+    const userId = `usr-demo-${Math.random().toString(36).slice(2, 9)}`;
+    const simulatedUser: User = {
+      id: userId,
+      app_metadata: { provider: cleanEmail.endsWith('@gmail.com') ? 'google_gmail' : 'email_verified' },
+      user_metadata: {
+        full_name: metadata?.full_name || cleanEmail.split('@')[0].toUpperCase(),
+        tier: 'QUANT_PRO',
+        firm: metadata?.firm || 'Supernova Trading Enclave',
+        role: metadata?.role || 'trader',
+        email_verified: true,
+      },
+      aud: 'authenticated',
+      confirmation_sent_at: new Date().toISOString(),
+      recovery_sent_at: '',
+      email_change_sent_at: '',
+      new_email: '',
+      new_phone: '',
+      invited_at: '',
+      action_link: '',
+      email: cleanEmail,
+      phone: '',
+      created_at: new Date().toISOString(),
+      confirmed_at: new Date().toISOString(),
+      email_confirmed_at: new Date().toISOString(),
+      phone_confirmed_at: '',
+      last_sign_in_at: new Date().toISOString(),
+      role: 'authenticated',
+      updated_at: new Date().toISOString(),
+    };
+
+    const jwtToken = createEnclaveJwt(userId, cleanEmail, 86400);
+    const simulatedSession: Session = {
+      access_token: jwtToken,
+      token_type: 'bearer',
+      expires_in: 86400,
+      expires_at: Math.floor(Date.now() / 1000) + 86400,
+      refresh_token: `snv_refresh_${Date.now()}`,
+      user: simulatedUser,
+    };
+
+    lastLoggedInUserIdRef.current = simulatedUser.id;
+    addLocalRegisteredEmail(cleanEmail);
+    setUser(simulatedUser);
+    setSession(simulatedSession);
+    localStorage.setItem(
+      LOCAL_STORAGE_SESSION_KEY,
+      JSON.stringify({ session: simulatedSession, user: simulatedUser })
+    );
+
+    await logAuthEvent(
+      'SIGN_IN',
+      {
+        email: cleanEmail,
+        user_id: simulatedUser.id,
+        provider: cleanEmail.endsWith('@gmail.com') ? 'gmail_confirmed' : 'email_confirmed',
+      },
+      'SUCCESS'
+    );
+
+    setLoading(false);
+    return { error: null };
+  };
+
+  // Resend Gmail / Email Confirmation Code
+  const resendEmailConfirmation = async (
+    email: string,
+    fullName?: string
+  ): Promise<{ error: Error | null; confirmationCode?: string }> => {
+    const cleanEmail = email.trim().toLowerCase();
+    if (!cleanEmail || !cleanEmail.includes('@')) {
+      return { error: new Error('Valid email address is required.') };
+    }
+
+    if (isSupabaseConfigured) {
+      try {
+        await supabase.auth.resend({
+          type: 'signup',
+          email: cleanEmail,
+        });
+      } catch {
+        // Fallback to backend code generator
+      }
+    }
+
+    try {
+      const resp = await fetch('/api/auth/send-confirmation', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: cleanEmail, fullName }),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        return { error: null, confirmationCode: data.confirmation_code };
+      }
+    } catch {
+      // Fallback
+    }
+
+    return { error: new Error('Failed to resend confirmation code.') };
+  };
+
+  // Continue with Google / Gmail confirmation flow
+  const signInWithGoogle = async (
+    gmailAddress?: string
+  ): Promise<{
+    error: Error | null;
+    needsConfirmation?: boolean;
+    email?: string;
+    confirmationCode?: string;
+  }> => {
+    const cleanGmail = (gmailAddress || '').trim().toLowerCase();
+
+    if (isSupabaseConfigured && !cleanGmail) {
+      try {
+        const { error } = await supabase.auth.signInWithOAuth({
+          provider: 'google',
+          options: {
+            redirectTo: `${window.location.origin}/macro-intel`,
+          },
+        });
+        if (!error) {
+          return { error: null };
+        }
+      } catch {
+        // Fallback to Gmail confirmation flow
+      }
+    }
+
+    if (!cleanGmail || !cleanGmail.includes('@')) {
+      return {
+        error: new Error('Please enter your Gmail address to receive a confirmation code.'),
+      };
+    }
+
+    const res = await resendEmailConfirmation(cleanGmail);
+    if (res.error) {
+      return { error: res.error };
+    }
+
+    return {
+      error: null,
+      needsConfirmation: true,
+      email: cleanGmail,
+      confirmationCode: res.confirmationCode,
+    };
+  };
+
+  // Sign Out handler - strictly await user_activity_logs / auth_activity_logs insert BEFORE calling supabase.auth.signOut()
   const signOut = async () => {
     setLoading(true);
-    const activeUser = user;
+    const activeUser = userRef.current || user;
     const activeEmail = activeUser?.email;
     const activeUserId = activeUser?.id;
 
+    // 1. Complete activity log insert while JWT session is still active
     if (activeUser && activeEmail) {
       try {
         await logAuthEvent(
@@ -605,6 +976,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             email: activeEmail,
             user_id: activeUserId,
             reason: 'user_action',
+            forceLog: true,
           },
           'SUCCESS'
         );
@@ -613,6 +985,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     }
 
+    // 2. Execute supabase.auth.signOut() AFTER activity log insert completes
     if (isSupabaseConfigured) {
       try {
         await supabase.auth.signOut();
@@ -686,8 +1059,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         loading,
         isConfigured: isSupabaseConfigured,
         activityLogs,
+        checkEmailExists,
         signIn,
         signUp,
+        verifyEmailConfirmation,
+        resendEmailConfirmation,
+        signInWithGoogle,
         signOut,
         requestBetaAccess,
         logAuthEvent,

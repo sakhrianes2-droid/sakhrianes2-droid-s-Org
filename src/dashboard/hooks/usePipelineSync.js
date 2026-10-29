@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { supabase, isSupabaseConfigured } from '../../lib/supabase';
+import { supabase, isSupabaseConfigured, authFetch } from '../../lib/supabase';
 import { useAuth } from '../../context/AuthContext';
 
 const SYNC_URL = '/api/pipeline/sync';
@@ -47,13 +47,8 @@ export function usePipelineSync(initialNodes = [], initialEdges = []) {
           }
         }
       } else {
-        const headers = {};
-        if (session?.access_token) {
-          headers['Authorization'] = `Bearer ${session.access_token}`;
-        }
-
         try {
-          const res = await fetch(FETCH_URL, { headers });
+          const res = await authFetch(FETCH_URL);
           if (res.ok) {
             const data = await res.json();
             if (mounted) {
@@ -127,16 +122,11 @@ export function usePipelineSync(initialNodes = [], initialEdges = []) {
         localStorage.removeItem(OFFLINE_KEY);
         setSyncStatus('IDLE');
       } else {
-        const headers = {
-          'Content-Type': 'application/json',
-        };
-        if (session?.access_token) {
-          headers['Authorization'] = `Bearer ${session.access_token}`;
-        }
-
-        const res = await fetch(SYNC_URL, {
+        const res = await authFetch(SYNC_URL, {
           method: 'PUT',
-          headers,
+          headers: {
+            'Content-Type': 'application/json',
+          },
           body: JSON.stringify(payload),
         });
 

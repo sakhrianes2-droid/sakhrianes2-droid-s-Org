@@ -9,6 +9,7 @@ import ActionNode from './ActionNode';
 import UpdateNode from './UpdateNode';
 import NodeSidebar from './NodeSidebar';
 import { usePipelineSync } from '../hooks/usePipelineSync';
+import { authFetch, createAuthenticatedWebSocket } from '../../lib/supabase';
 
 const nodeTypes = {
   trigger: TriggerNode,
@@ -66,8 +67,8 @@ const PipelineCanvas = ({ isMobileMenuOpen, setIsMobileMenuOpen }) => {
     const fetchBackendData = async () => {
       try {
         await Promise.all([
-          fetch("/api/feeds"),
-          fetch("/api/prices")
+          authFetch("/api/feeds"),
+          authFetch("/api/prices")
         ]);
       } catch (err) {
         // Silent catch for background polling
@@ -178,7 +179,7 @@ const PipelineCanvas = ({ isMobileMenuOpen, setIsMobileMenuOpen }) => {
   // WebSocket Signal Listener
   useEffect(() => {
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws/terminal`);
+    const socket = createAuthenticatedWebSocket(`${wsProtocol}//${window.location.host}/ws/terminal`);
     
     socket.onmessage = (event) => {
       try {

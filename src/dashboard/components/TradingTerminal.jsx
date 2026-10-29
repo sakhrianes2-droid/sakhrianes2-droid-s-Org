@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef } from 'react';
 import { CommandCenter } from './CommandCenter';
+import { createAuthenticatedWebSocket } from '../../lib/supabase';
 
 const TradingTerminal = () => {
     const [logs, setLogs] = useState([]);
@@ -15,7 +16,7 @@ const TradingTerminal = () => {
     useEffect(() => {
         let isSubscribed = true;
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws/terminal`);
+        const socket = createAuthenticatedWebSocket(`${wsProtocol}//${window.location.host}/ws/terminal`);
         socket.onopen = () => { if (isSubscribed) setConnected(true); };
         socket.onmessage = (event) => {
             if (!isSubscribed) return;
