@@ -1,0 +1,6 @@
+{
+  "name": "Supernova AI Trading System",
+  "description": "An autonomous institutional-grade high-speed AI trading system dashboard featuring news catalyst analysis, real-time signals, risk management, and modular strategies.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
